@@ -1,0 +1,6 @@
+afterimage
+afterimage.exe
+dist/
+
+*.test
+*.out

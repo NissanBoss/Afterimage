@@ -1,0 +1,393 @@
+name: Test
+
+# All three systems for the code, and then the part that matters: caches
+# and databases written by the things that write them in the real world,
+# read back and checked finding by finding. The unit tests build most of
+# their own fixtures, which means they are only as right as my reading of
+# each format. What this program has to work on is what Python's SQLite,
+# Windows' own shortcut writer and a real PNG encoder actually produce.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Tests
+        run: go test -v ./...
+
+      - name: The other systems still compile
+        shell: bash
+        run: |
+          for target in windows linux darwin; do
+            GOOS=$target go vet ./...
+            GOOS=$target go build -o /dev/null .
+          done
+
+  real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      # A profile with a thumbnail cache and a browser history in it, both
+      # written the way the real things write them: the PNG is a valid
+      # image with a real text chunk, and the history is a real SQLite
+      # database with the schema Chromium uses.
+      - name: Build a profile with real caches in it
+        run: |
+          mkdir -p profile/.cache/thumbnails/large
+          mkdir -p profile/.cache/thumbnails/fail/gnome-thumbnail-factory
+          mkdir -p profile/.config/google-chrome/Default
+          mkdir -p profile/Documents profile/Downloads
+
+          cat > thumb.py <<'PY'
+          import struct, sys, zlib
+
+          def chunk(kind, data):
+              return (struct.pack(">I", len(data)) + kind + data
+                      + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+
+          rows = b"".join(b"\x00" + b"\x30\x60\x90" * 16 for _ in range(16))
+          png = (b"\x89PNG\r\n\x1a\n"
+                 + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0))
+                 + chunk(b"tEXt", b"Thumb::URI\x00" + sys.argv[2].encode())
+                 + chunk(b"tEXt", b"Thumb::Image::Width\x00" + b"4032")
+                 + chunk(b"IDAT", zlib.compress(rows))
+                 + chunk(b"IEND", b""))
+          open(sys.argv[1], "wb").write(png)
+          PY
+
+          here="$PWD/profile"
+          echo "still here" > "$here/Documents/kept.txt"
+
+          python3 thumb.py profile/.cache/thumbnails/large/a.png "file://$here/Documents/deleted-report.pdf"
+          python3 thumb.py profile/.cache/thumbnails/large/b.png "file://$here/Documents/kept.txt"
+          python3 thumb.py profile/.cache/thumbnails/large/c.png "file:///media/runner/STICK/wedding.jpg"
+          python3 thumb.py profile/.cache/thumbnails/fail/gnome-thumbnail-factory/d.png "file://$here/Downloads/payslip.pdf"
+
+          # Every one of those PNGs has to be a real image, or the check
+          # below proves nothing about the reader.
+          python3 - <<'PY'
+          import glob, struct, zlib
+          for name in glob.glob("profile/.cache/thumbnails/**/*.png", recursive=True):
+              body = open(name, "rb").read()
+              assert body[:8] == b"\x89PNG\r\n\x1a\n", name
+              at, seen = 8, []
+              while at < len(body):
+                  n = struct.unpack(">I", body[at:at+4])[0]
+                  kind = body[at+4:at+8]
+                  data = body[at+8:at+8+n]
+                  want = struct.unpack(">I", body[at+8+n:at+12+n])[0]
+                  assert zlib.crc32(kind + data) & 0xffffffff == want, (name, kind)
+                  seen.append(kind)
+                  at += 12 + n
+              assert b"IHDR" in seen and b"IDAT" in seen and b"tEXt" in seen, (name, seen)
+          print("every fixture is a valid PNG with a checked text chunk")
+          PY
+
+          python3 - <<'PY'
+          import os, sqlite3
+          here = os.path.join(os.getcwd(), "profile")
+          db = sqlite3.connect("profile/.config/google-chrome/Default/History")
+          db.execute("""CREATE TABLE downloads (
+              id INTEGER PRIMARY KEY, guid VARCHAR NOT NULL,
+              current_path LONGVARCHAR NOT NULL, target_path LONGVARCHAR NOT NULL,
+              start_time INTEGER NOT NULL, received_bytes INTEGER NOT NULL,
+              total_bytes INTEGER NOT NULL, state INTEGER NOT NULL,
+              tab_url LONGVARCHAR NOT NULL, mime_type VARCHAR(255) NOT NULL)""")
+          rows = [
+              ("invoice-2019.pdf", "https://accounts.example.test/billing", 13350000000000000),
+              ("contract.docx",    "https://accounts.example.test/legal",   13350000000000000),
+              ("holiday.zip",      "https://files.example.test/share/9",    13360000000000000),
+          ]
+          for i, (name, url, when) in enumerate(rows):
+              path = os.path.join(here, "Downloads", name)
+              db.execute("INSERT INTO downloads VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (i + 1, "guid-%d" % i, path, path, when, 1000, 1000, 1, url, "application/pdf"))
+          # One that is still on the disk, so the cross check has to tell
+          # the two apart rather than reporting the whole table.
+          kept = os.path.join(here, "Documents", "kept.txt")
+          db.execute("INSERT INTO downloads VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (9, "guid-9", kept, kept, 13360000000000000, 10, 10, 1,
+                      "https://files.example.test/share/10", "text/plain"))
+          db.commit(); db.close()
+          print("wrote a Chromium history with four downloads, one of them still on the disk")
+          PY
+
+      - name: Read it
+        run: |
+          go build -o afterimage-check .
+          AFTERIMAGE_HOME="$PWD/profile" ./afterimage-check --all > out.txt 2>&1 || true
+          cat out.txt
+
+      # Every one of these is something the profile is known to contain,
+      # and the tag is part of the pattern, because a finding in the wrong
+      # pile is the failure this program cannot afford.
+      - name: What the profile is known to hold
+        run: |
+          check() {
+            want="$1"; why="$2"
+            if ! grep -q "$want" out.txt; then
+              echo "MISSED: $why"
+              echo "  wanted: $want"
+              exit 1
+            fi
+            echo "  ok: $why"
+          }
+          missing() {
+            want="$1"; why="$2"
+            if grep -q "$want" out.txt; then
+              echo "WRONG: $why"
+              grep -n "$want" out.txt
+              exit 1
+            fi
+            echo "  ok: $why"
+          }
+
+          check '\[COPIED  \].*picture'          'the thumbnail of the deleted report'
+          check 'de.*\.pdf'                      'and it named it'
+          check '\[OUTSIDE \]'                   'the thumbnail of a file on an unmounted stick'
+          check '\[NAMED   \].*could not be thumbnailed' 'the fail entry, which has a path and no picture'
+          check '\[NAMED   \].*download'         'the downloads whose files are gone'
+          check '\[TELLS   \].*source of'        'the sites those downloads came from'
+          # Masked, because this report is the masked one. Asking for
+          # "example" to survive here would be asking the masking not to
+          # work, which is what the last step of this job checks that it
+          # does. The full host is checked there, with --reveal on.
+          check 'ac.*\.test'                     'and it named one, with its middle covered'
+
+          # The file that is still there must not appear anywhere as gone.
+          missing 'kept.txt'                     'the file still on the disk was not reported'
+
+      # .DS_Store files written by real Macs. There is no way to produce
+      # one on a runner, so these are fetched from two projects that keep
+      # samples: the reference implementation of the format, whose own test
+      # suite asserts on the three names in its file, and an independent
+      # parser whose readme publishes the six names in its own. Agreeing
+      # with both is the only thing that shows this reader is right rather
+      # than merely self consistent.
+      - name: Read .DS_Store files written by real Macs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p samples
+          gh api repos/al45tair/ds_store/contents/tests/Test_DS_Store \
+            --jq .content | base64 -d > samples/reference.DS_Store
+          gh api repos/gehaxelt/Python-dsstore/contents/samples/.DS_Store.ctf \
+            --jq .content | base64 -d > samples/ctf.DS_Store
+          ls -l samples
+
+          AFTERIMAGE_DSSTORE_DIR="$PWD/samples" go test -run TestAgainstRealDSStoreFiles -v .
+
+      - name: A clean profile is reported as clean
+        run: |
+          mkdir -p tidy/Documents
+          echo hello > tidy/Documents/a.txt
+          set +e
+          AFTERIMAGE_HOME="$PWD/tidy" ./afterimage-check > tidy.txt 2>&1
+          code=$?
+          set -e
+          cat tidy.txt
+          if [ "$code" -ne 0 ]; then
+            echo "An account with nothing wrong with it was reported as needing a decision."
+            exit 1
+          fi
+          grep -q "Nothing turned up" tidy.txt || {
+            echo "it claimed more than it knows"; exit 1; }
+
+      - name: And it wrote nothing anywhere
+        run: |
+          # From an empty directory, so that anything at all appearing is
+          # this program having written it, and with the profile hashed
+          # before and after so that a read that quietly rewrites a cache
+          # cannot pass.
+          before=$(find profile -type f | sort | xargs sha256sum | sha256sum)
+          mkdir -p empty && cd empty
+          listed=$(find . | sort)
+          AFTERIMAGE_HOME="$PWD/../profile" ../afterimage-check --all >/dev/null 2>&1 || true
+          AFTERIMAGE_HOME="$PWD/../profile" ../afterimage-check --reveal >/dev/null 2>&1 || true
+          after_listed=$(find . | sort)
+          cd ..
+          after=$(find profile -type f | sort | xargs sha256sum | sha256sum)
+
+          if [ "$listed" != "$after_listed" ]; then
+            echo "something appeared in the working directory"
+            exit 1
+          fi
+          if [ "$before" != "$after" ]; then
+            echo "the profile changed while being read"
+            exit 1
+          fi
+          echo "read the whole profile twice and changed nothing in it"
+
+      # The masking is the difference between a report somebody can paste
+      # into an issue and a report that hands over a list of their files.
+      - name: Nothing gets out without asking for it
+        run: |
+          AFTERIMAGE_HOME="$PWD/profile" ./afterimage-check --all > covered.txt 2>&1 || true
+          for name in deleted-report.pdf invoice-2019.pdf wedding.jpg payslip.pdf; do
+            if grep -q "$name" covered.txt; then
+              echo "$name reached the report in full with masking on"
+              grep -n "$name" covered.txt
+              exit 1
+            fi
+          done
+          echo "  ok: no full file name in the default report"
+
+          AFTERIMAGE_HOME="$PWD/profile" ./afterimage-check --all --reveal > shown.txt 2>&1 || true
+          for name in deleted-report.pdf invoice-2019.pdf accounts.example.test; do
+            grep -q "$name" shown.txt || { echo "--reveal did not show $name"; exit 1; }
+          done
+          echo "  ok: --reveal shows them, host included"
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      # Shortcuts made by Windows itself, through the same COM object every
+      # installer uses. This is the check that catches a misreading of the
+      # real format rather than agreement with a fixture written here.
+      - name: Make real shortcuts and then delete what they point at
+        shell: pwsh
+        run: |
+          $d = "$PWD\profile"
+          $rec = "$d\AppData\Roaming\Microsoft\Windows\Recent"
+          New-Item -ItemType Directory -Force $rec, "$d\Desktop" | Out-Null
+          $names = @("quarterly report.docx", "keys backup.kdbx", "still here.txt")
+          foreach ($n in $names) { New-Item -ItemType File "$d\Desktop\$n" -Force | Out-Null }
+          $s = New-Object -ComObject WScript.Shell
+          foreach ($f in Get-ChildItem "$d\Desktop") {
+            $l = $s.CreateShortcut((Join-Path $rec ($f.BaseName + ".lnk")))
+            $l.TargetPath = $f.FullName
+            $l.Save()
+          }
+          Remove-Item "$d\Desktop\quarterly report.docx", "$d\Desktop\keys backup.kdbx"
+          Get-ChildItem $rec
+
+      - name: Read them
+        shell: bash
+        run: |
+          go build -o afterimage-check.exe .
+          AFTERIMAGE_HOME="$PWD/profile" ./afterimage-check.exe --all > out.txt 2>&1 || true
+          cat out.txt
+
+          grep -q '\[NAMED   \].*named in Recent' out.txt || {
+            echo "the shortcuts to deleted files were not reported"; exit 1; }
+          grep -q '2 files are named in Recent' out.txt || {
+            echo "the count is wrong: two were deleted and one was left"; exit 1; }
+          grep -q 'still here' out.txt && {
+            echo "the file that is still on the disk was reported as gone"; exit 1; }
+          grep -q '\[TELLS   \].*name of this machine' out.txt || {
+            echo "the tracker block on a real Windows shortcut was not read"; exit 1; }
+          echo "  ok: read shortcuts written by Windows and told the deleted ones apart"
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      # The Quick Look cache is the one thing here that cannot be built by
+      # hand: it is written by a service on a real Mac and it lives in a
+      # per user directory under /var/folders. A runner is headless, so
+      # whether qlmanage produces one at all is not certain. The step says
+      # which happened, and only fails if a cache exists and this could not
+      # read it, because a check that cannot tell those two apart is worse
+      # than no check.
+      - name: Make Quick Look draw some previews
+        run: |
+          mkdir -p profile/Documents
+          cd profile/Documents
+          printf 'a report nobody should still have\n' > deleted-report.txt
+          printf 'this one stays\n' > kept.txt
+          cp /System/Library/Desktop\ Pictures/*.heic photo.heic 2>/dev/null || \
+            printf 'not a real image\n' > photo.txt
+
+          # Solo -t, que dibuja la miniatura y termina. El -p que habia
+          # aqui abre la ventana de vista previa y en un runner sin pantalla
+          # se queda esperando para siempre: la primera vez que este flujo
+          # llego a ejecutarse, el trabajo estuvo cuarenta minutos colgado
+          # ahi. El "|| true" no salva de eso, porque el problema no es que
+          # falle, es que no acaba.
+          for f in *; do
+            qlmanage -t -s 256 -o /tmp/thumbs "$f" >/dev/null 2>&1 || true
+          done
+          cd ../..
+
+          # Now delete one of them, which is the whole point.
+          rm profile/Documents/deleted-report.txt
+
+          echo "TMPDIR is $TMPDIR"
+          found=$(find /var/folders -name index.sqlite -path '*QuickLook*' 2>/dev/null | head -5)
+          if [ -z "$found" ]; then
+            echo "NO_CACHE" > cache-state
+            echo "this runner produced no Quick Look cache, so there is nothing to read"
+          else
+            echo "HAVE_CACHE" > cache-state
+            echo "$found"
+            ls -l $found
+          fi
+
+      - name: Read it
+        run: |
+          go build -o afterimage-check .
+          AFTERIMAGE_HOME="$PWD/profile" ./afterimage-check --all --reveal > out.txt 2>&1 || true
+          cat out.txt
+
+          if [ "$(cat cache-state)" = "NO_CACHE" ]; then
+            echo "skipped: no cache on this runner"
+            exit 0
+          fi
+          if ! grep -q "Quick Look" out.txt; then
+            echo "there is a Quick Look cache on this machine and nothing was read out of it"
+            exit 1
+          fi
+          echo "  ok: read a Quick Look cache written by macOS"
+
+      - name: The rest of it still works here
+        run: go test -v ./...
