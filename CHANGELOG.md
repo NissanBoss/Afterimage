@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v1.1
+
+Published again, from a repository of its own with a fresh history; v1
+lived in the one before.
 
 - **macOS: the Quick Look cache is found again on current systems.** Apple
   moved it. It used to sit straight under the per user caches directory,
